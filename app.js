@@ -3,13 +3,12 @@
 // Fan-made MIDI sources (BitMidi, FreeMIDI) are opt-in, fine for practice but
 // not for release; Mutopia (public domain) is always on.
 //
-// Mutopia and FreeMIDI send no CORS headers (and FreeMIDI needs a cookie
-// handshake), so they go through a proxy; ./site.json says where it is.
-// scripts/serve.py answers {proxy:true}: its own same-origin /proxy. The
-// static build (scripts/deploy-web.sh, GitHub Pages) ships {proxy:"<base URL>"},
-// the hosted ready-set-proxy. {proxy:false} or no site.json means no proxy:
-// Mutopia is searched in the frozen /try/ catalogue and FreeMIDI is left out.
-// BitMidi is always fetched directly (it allows any origin). All paths are
+// Two hosts serve this page. scripts/serve.py answers ./site.json with
+// {proxy:true} and proxies the sources (Mutopia and FreeMIDI send no CORS
+// headers, and FreeMIDI needs a cookie handshake). The static build
+// (scripts/deploy-web.sh, GitHub Pages) ships a site.json with {proxy:false}:
+// there BitMidi is fetched directly (it allows any origin), Mutopia is searched
+// in the frozen /try/ catalogue, and FreeMIDI is left out. All paths are
 // relative so the page also works under a subpath.
 
 import init, {
@@ -35,25 +34,15 @@ import {
   firstFreemidiArtist, srcLabel, recLabel,
 } from "./shared/sources.js";
 import { searchCatalog } from "./try/search.js";
-import { midiPlayer, rollView, seekOnRoll } from "./shared/midiplay.js";
-import { valueBox } from "./shared/vendor/design/valuebox.js";
-import { outputDelay } from "./shared/vendor/design/playhead.js";
 
-// What this host offers: { proxy, template }. `proxy` is the proxy's base URL
-// ("./" for serve.py's same-origin proxy, "" for none). A missing or
-// unreadable site.json counts as no proxy.
-const proxyBase = (p) => {
-  if (p === true) return "./";
-  if (typeof p !== "string" || !p) return "";
-  return p.endsWith("/") ? p : `${p}/`;
-};
+const proxied = (url) => `./proxy?url=${encodeURIComponent(url)}`;
+
+// What this host offers: { proxy, template }. A missing or unreadable
+// site.json counts as the static build.
 const site = fetch("./site.json")
   .then((r) => (r.ok ? r.json() : {}))
   .catch(() => ({}))
-  .then((s) => ({ proxy: proxyBase(s.proxy), template: !!s.template }));
-
-const proxied = async (url) => `${(await site).proxy}proxy?url=${encodeURIComponent(url)}`;
-const freemidiUrl = async (id) => `${(await site).proxy}${freemidiDownloadPath(id).replace(/^\//, "")}`;
+  .then((s) => ({ proxy: !!s.proxy, template: !!s.template }));
 
 const $ = (id) => document.getElementById(id);
 const results = $("results");
@@ -96,18 +85,14 @@ site.then(({ proxy }) => {
   $("src-fan").innerHTML = "<b>BitMidi</b> fan-made MIDI, searched when included";
 });
 
-// Transpose: the design system's value box (-12..+12, default 0), like the hero's.
-// Changing it while a preview is showing re-renders the preview with the new
-// shift; a short wait lets a held step settle first.
-let rerender = 0;
-const transpose = valueBox($("semitones"), {
-  min: -12, max: 12, value: 0, labelledBy: "semitones-label",
-  format: (v) => (v > 0 ? "+" : "") + v,
-  onChange: () => {
-    clearTimeout(rerender);
-    rerender = setTimeout(() => { if (player && !$("player-host").hidden) loadPreview(); }, 250);
-  },
-});
+// Populate the transpose dropdown (-12..+12, default 0).
+for (let s = -12; s <= 12; s++) {
+  const o = document.createElement("option");
+  o.value = s;
+  o.textContent = s === 0 ? "0 (original)" : (s > 0 ? `+${s}` : `${s}`);
+  if (s === 0) o.selected = true;
+  $("semitones").appendChild(o);
+}
 
 // Optional Live template (web/template.als.xml): if present, .als exports clone
 // its instruments/MPE; otherwise the built-in template is used, with a stock
@@ -115,7 +100,7 @@ const transpose = valueBox($("semitones"), {
 let templateXml = null;
 async function ready() {
   await init();
-  const none = "Instruments: none (minimal template, add them in Live)";
+  const none = "Instruments: none (minimal template, add them in Ableton Live)";
   // Only the local server can have a template (it's gitignored, never deployed),
   // so the static site doesn't ask for one.
   if (!(await site).template) { $("template-state").textContent = none; return; }
@@ -123,7 +108,7 @@ async function ready() {
     const res = await fetch("./template.als.xml");
     if (res.ok) {
       templateXml = await res.text();
-      $("template-state").textContent = "Instruments: included (from your Live template)";
+      $("template-state").textContent = "Instruments: included (from your Ableton Live template)";
     } else {
       $("template-state").textContent = none;
     }
@@ -136,12 +121,12 @@ const wasmReady = ready();
 // Fetch + normalize via the shared source layer (also used by the extension).
 // `direct` skips the proxy for sources that send CORS headers themselves.
 const getText = async (url, direct = false) => {
-  const res = await fetch(direct ? url : await proxied(url));
+  const res = await fetch(direct ? url : proxied(url));
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.text();
 };
-const searchBitmidi = async (q) => normBitmidi(await getText(bitmidiSearchUrl(q), true));
-// Live Mutopia search needs the proxy; without one the page searches the frozen
+const searchBitmidi = async (q) => normBitmidi(await getText(bitmidiSearchUrl(q), !(await site).proxy));
+// Live Mutopia search needs the proxy; the static site searches the frozen
 // /try/ catalogue instead (the same public-domain pieces the demo plays).
 let catalogue = null;
 const loadCatalogue = async () => {
@@ -275,12 +260,13 @@ function applyFilter() {
 }
 
 // Fetch the .mid bytes for a MIDI-bearing result. FreeMIDI goes through the
-// proxy's two-step endpoint; live Mutopia files go through the proxy; BitMidi
-// (any origin allowed) and catalogue rows (files on this site) go direct.
+// proxy's two-step endpoint; the rest go through the proxy when there is one,
+// and straight to the file otherwise (BitMidi allows any origin, catalogue
+// rows are files on this site).
 async function fetchMidiBytes(r) {
   const { proxy } = await site;
-  const url = r.source === "freemidi" ? await freemidiUrl(r.freemidiId)
-    : (r.direct || r.source === "midi" || !proxy) ? r.downloadUrl : await proxied(r.downloadUrl);
+  const url = r.source === "freemidi" ? `.${freemidiDownloadPath(r.freemidiId)}`
+    : (r.direct || !proxy) ? r.downloadUrl : proxied(r.downloadUrl);
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return new Uint8Array(await res.arrayBuffer());
@@ -410,7 +396,7 @@ drop.addEventListener("drop", (e) => {
 $("download").addEventListener("click", async () => {
   if (!selected) return;
   const format = $("format").value;
-  const semitones = transpose.value;
+  const semitones = parseInt($("semitones").value, 10) || 0;
   $("download").disabled = true;
   try {
     setStatus("Building…");
@@ -426,64 +412,69 @@ $("download").addEventListener("click", async () => {
   }
 });
 
-// ---- Preview: render the .mid in-browser and play it --------------------------
-// shared/midiplay.js: spessasynth with the design system's shared General MIDI
-// bank (the same sounds as every other tool here), a small play / stop / seek
-// bar, and a piano roll that follows the playhead. Everything is vendored, so
-// nothing loads from a CDN.
-let player = null;        // midiPlayer, made on the first Preview
-let roll = null;          // rollView over #preview-roll
+// ---- Preview: render the .mid in-browser and play it in an embedded player --
+// Uses html-midi-player (a web component wrapping a General MIDI soundfont
+// player) for play/pause + a seekable playhead. It's lazy-loaded from a CDN on
+// first use via dynamic import(), so a CDN/network failure only affects Preview,
+// never the rest of the app.
+const PLAYER_LIB = "https://cdn.jsdelivr.net/npm/html-midi-player@1.5.0/+esm";
+
+let player = null;        // the <midi-player> element, once created
+let previewUrl = null;    // object URL of the current preview .mid
 let previewGen = 0;       // bumped per render; makes superseded renders bail out
 
 // Stop any playing preview and hide the player. Bumping previewGen also makes
 // any in-flight render bail before it can start audio for the old selection.
 function stopPreview() {
   previewGen++;
-  if (player) player.halt();
+  if (player) { try { player.stop(); } catch { /* player not ready */ } }
   $("player-host").hidden = true;
 }
 
-function ensurePlayer() {
+async function ensurePlayer() {
   if (player) return player;
-  roll = rollView($("preview-roll"));
-  player = midiPlayer($("preview-bar"), {
-    onTick: (t) => roll.draw(t == null ? null : player.beatAt(t)),
-  });
-  seekOnRoll($("preview-roll"), roll, player);  // click or drag on the roll moves the playhead
-  window.addEventListener("resize", () => roll.draw(player.playing || player.time ? player.beatAt(player.time) : null));
-  window.addEventListener("tabridge-theme", () => roll.repaint());
-  window.TabridgeRoll.onSchemeChange(() => roll.repaint());
-  // for checks: is it heard, where is it
-  window.readySetPlayer = { peak: () => player.peak(), get time() { return player.time; },
-                            get delay() { return outputDelay(player.ctx); },   // what the head trails the sound by
-                            get playing() { return player.playing; }, get beat() { return player.beatAt(player.time); },
-                            get page() { return roll.page; }, get head() { return roll.head; } };
+  await import(PLAYER_LIB); // registers the <midi-player> custom element
+  player = document.createElement("midi-player");
+  player.setAttribute("sound-font", ""); // "" = the player's default GM soundfont
+  $("player-host").appendChild(player);
   return player;
 }
 
-// Build the .mid for the CURRENT Transpose setting, load it into the player and
-// start playback. Re-callable: changing Transpose re-renders with the new shift,
-// from the same moment. The `previewGen` token makes a superseded render ignore
-// its own async callbacks so rapid re-renders can't race.
+// Build the .mid for the CURRENT Transpose setting, load it into the embedded
+// player (which owns play/pause/seek), and start playback. Re-callable: changing
+// Transpose re-renders with the new shift. The `previewGen` token makes a
+// superseded render ignore its own async callbacks so rapid re-renders can't race.
 async function loadPreview() {
   const myGen = ++previewGen;
-  const semitones = transpose.value;
-  ensurePlayer().unlock();                  // inside the click, before any await
-  const at = player.playing ? player.time : 0;
+  const semitones = parseInt($("semitones").value, 10) || 0;
   $("preview").disabled = true;
   $("preview").textContent = "Loading…";
   try {
     setStatus("Rendering preview…");
     const bytes = await buildBytes("mid", semitones);
     if (myGen !== previewGen) return;
-    setStatus("Loading sounds…");
-    if (!(await player.load(bytes)) || myGen !== previewGen) return;
+
+    await ensurePlayer();
+    if (myGen !== previewGen) return;
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = URL.createObjectURL(new Blob([bytes], { type: "audio/midi" }));
+
+    // Setting src kicks off async parse + soundfont load; wait for it to finish
+    // (or fall back after a beat) before starting so start() has something ready.
+    await new Promise((resolve) => {
+      player.addEventListener("load", resolve, { once: true });
+      player.src = previewUrl;
+      setTimeout(resolve, 8000); // safety net if "load" never fires
+    });
+    if (myGen !== previewGen) return;
+
     $("player-host").hidden = false;
-    roll.setSong(JSON.parse(midi_build_notes_json(bytes, 0)));
-    player.play(at);
     setStatus(`Preview ready (${semitones >= 0 ? "+" : ""}${semitones} st). Play/seek below.`);
+    // start() may return a promise or nothing depending on player state; wrap so a
+    // non-promise return can't throw.
+    Promise.resolve(player.start()).catch(() => {});
   } catch (err) {
-    if (myGen === previewGen) setStatus(`Preview failed: ${err.message || err}`, true);
+    if (myGen === previewGen) setStatus(`Preview failed: ${err}`, true);
   } finally {
     if (myGen === previewGen) { $("preview").disabled = false; $("preview").textContent = "Preview"; }
   }
@@ -496,6 +487,11 @@ $("file").addEventListener("change", (e) => {
 });
 
 $("preview").addEventListener("click", () => { if (selected) loadPreview(); });
+
+// Changing Transpose while a preview is showing re-renders it with the new shift.
+$("semitones").addEventListener("change", () => {
+  if (player && !$("player-host").hidden) loadPreview();
+});
 
 function downloadBytes(bytes, name) {
   const blob = new Blob([bytes], { type: "application/octet-stream" });
